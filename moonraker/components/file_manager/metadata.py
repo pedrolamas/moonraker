@@ -20,7 +20,14 @@ import uuid
 import logging
 import shlex
 import subprocess
+import io
 from PIL import Image
+try:
+    import qoi
+    import numpy as np
+    HAS_QOI_SUPPORT = True
+except ImportError:
+    HAS_QOI_SUPPORT = False
 
 # Annotation imports
 from typing import (
@@ -122,6 +129,37 @@ def regex_find_min_float(pattern: str, data: str) -> Optional[float]:
 def regex_find_max_float(pattern: str, data: str) -> Optional[float]:
     result = regex_find_floats(pattern, data)
     return max(result) if result else None
+
+
+def detect_image_format(data: bytes) -> str:
+    """Detect image format from binary data using magic bytes."""
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    elif data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    elif data.startswith(b'qoif'):
+        return 'qoi'
+    else:
+        # Default to PNG for unknown formats to maintain compatibility
+        return 'png'
+
+
+def load_image_from_data(data: bytes, image_format: str) -> Optional[Image.Image]:
+    """Load an image from binary data based on the detected format."""
+    try:
+        if image_format == 'qoi':
+            if not HAS_QOI_SUPPORT:
+                logger.info("QOI support not available, QOI library not installed")
+                return None
+            # Decode QOI to numpy array then convert to PIL Image
+            img_array = qoi.decode(data)
+            return Image.fromarray(img_array)
+        else:
+            # For PNG and JPG, PIL can handle directly
+            return Image.open(io.BytesIO(data))
+    except Exception as e:
+        logger.info(f"Error loading image data: {e}")
+        return None
 
 
 # Slicer parsing implementations
@@ -286,17 +324,32 @@ class BaseSlicer(object):
                     f"MetadataError: Thumbnail Size Mismatch: "
                     f"detected {info[2]}, actual {len(data)}")
                 continue
-            thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
-            thumb_path = os.path.join(thumb_dir, thumb_name)
-            rel_thumb_path = os.path.join(".thumbs", thumb_name)
-            with open(thumb_path, "wb") as f:
-                f.write(base64.b64decode(data.encode()))
-            parsed_matches.append({
-                'width': info[0], 'height': info[1],
-                'size': os.path.getsize(thumb_path),
-                'relative_path': rel_thumb_path})
-            if info[0] == 32 and info[1] == 32:
-                has_miniature = True
+            
+            # Decode the base64 data and detect image format
+            try:
+                binary_data = base64.b64decode(data.encode())
+                image_format = detect_image_format(binary_data)
+                
+                # Use appropriate file extension based on detected format
+                ext = 'jpg' if image_format == 'jpg' else image_format
+                thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.{ext}"
+                thumb_path = os.path.join(thumb_dir, thumb_name)
+                rel_thumb_path = os.path.join(".thumbs", thumb_name)
+                
+                # Write the original binary data to preserve format
+                with open(thumb_path, "wb") as f:
+                    f.write(binary_data)
+                    
+                parsed_matches.append({
+                    'width': info[0], 'height': info[1],
+                    'size': os.path.getsize(thumb_path),
+                    'relative_path': rel_thumb_path})
+                if info[0] == 32 and info[1] == 32:
+                    has_miniature = True
+            except Exception as e:
+                logger.info(f"Error processing thumbnail: {e}")
+                continue
+                
         if len(parsed_matches) > 0 and not has_miniature:
             # find the largest thumb index
             largest_match = parsed_matches[0]
@@ -311,8 +364,15 @@ class BaseSlicer(object):
                 thumb_dir, f"{thumb_base}-32x32.png")
             # read file
             try:
-                with Image.open(thumb_path) as im:
-                    # Create 32x32 thumbnail
+                # Detect original format and load appropriately
+                with open(thumb_path, "rb") as f:
+                    original_data = f.read()
+                original_format = detect_image_format(original_data)
+                
+                # Load image using the appropriate method
+                im = load_image_from_data(original_data, original_format)
+                if im is not None:
+                    # Create 32x32 thumbnail and save as PNG for consistency
                     im.thumbnail((32, 32))
                     im.save(thumb_path_small, format="PNG")
                     parsed_matches.insert(0, {
@@ -320,6 +380,8 @@ class BaseSlicer(object):
                         'size': os.path.getsize(thumb_path_small),
                         'relative_path': rel_path_small
                     })
+                else:
+                    logger.info(f"Failed to load image for thumbnail generation: {thumb_path}")
             except Exception as e:
                 logger.info(str(e))
         return parsed_matches
